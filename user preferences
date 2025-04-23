@@ -1,0 +1,226 @@
+import numpy as np
+from sklearn.neighbors import NearestNeighbors
+from flask_login import current_user
+from app import db
+from models import User, ProgrammingContent, UserProgress
+
+def get_user_vector(user_id):
+    """
+    Generate a feature vector for a user based on their profile and learning history.
+    
+    Parameters:
+    user_id (int): The ID of the user
+    
+    Returns:
+    numpy.ndarray: A feature vector representing the user
+    """
+    user = User.query.get(user_id)
+    if not user:
+        return None
+    
+    # Get user preferences
+    known_languages = set(user.get_known_languages())
+    target_languages = set(user.get_target_languages())
+    learning_goals = set(user.get_learning_goals())
+    
+    # Get user progress history
+    progress = UserProgress.query.filter_by(user_id=user_id).all()
+    
+    # Extract completed content ids and their topics
+    completed_content_ids = []
+    completed_languages = set()
+    completed_levels = set()
+    
+    for p in progress:
+        if p.status == "Completed":
+            completed_content_ids.append(p.content_id)
+            content = ProgrammingContent.query.get(p.content_id)
+            if content:
+                completed_languages.add(content.programming_language)
+                completed_levels.add(content.difficulty_level)
+    
+    # Create a simple feature vector
+    # This could be enhanced with more sophisticated features
+    features = []
+    
+    # Experience level (0 = Beginner, 1 = Intermediate, 2 = Advanced)
+    experience_map = {"Beginner": 0, "Intermediate": 1, "Advanced": 2}
+    features.append(experience_map.get(user.programming_experience, 0))
+    
+    # Get all programming languages and create one-hot encoding
+    all_languages = db.session.query(ProgrammingContent.programming_language).distinct().all()
+    all_languages = [lang[0] for lang in all_languages]
+    
+    # Known languages (one-hot)
+    for lang in all_languages:
+        features.append(1 if lang in known_languages else 0)
+    
+    # Target languages (one-hot)
+    for lang in all_languages:
+        features.append(1 if lang in target_languages else 0)
+    
+    # Completed languages (one-hot)
+    for lang in all_languages:
+        features.append(1 if lang in completed_languages else 0)
+    
+    # Difficulty levels completed (one-hot)
+    for level in ["Beginner", "Intermediate", "Advanced"]:
+        features.append(1 if level in completed_levels else 0)
+    
+    return np.array(features).reshape(1, -1)
+
+def get_content_vector(content_id):
+    """
+    Generate a feature vector for a content item.
+    
+    Parameters:
+    content_id (int): The ID of the content
+    
+    Returns:
+    numpy.ndarray: A feature vector representing the content
+    """
+    content = ProgrammingContent.query.get(content_id)
+    if not content:
+        return None
+    
+    # Create a simple feature vector
+    features = []
+    
+    # Difficulty level (0 = Beginner, 1 = Intermediate, 2 = Advanced)
+    level_map = {"Beginner": 0, "Intermediate": 1, "Advanced": 2}
+    features.append(level_map.get(content.difficulty_level, 0))
+    
+    # Get all programming languages and create one-hot encoding
+    all_languages = db.session.query(ProgrammingContent.programming_language).distinct().all()
+    all_languages = [lang[0] for lang in all_languages]
+    
+    # Language (one-hot)
+    for lang in all_languages:
+        features.append(1 if content.programming_language == lang else 0)
+    
+    # Content type (one-hot)
+    for content_type in ["Tutorial", "Exercise", "Reference"]:
+        features.append(1 if content.content_type == content_type else 0)
+    
+    return np.array(features)
+
+def get_user_recommendations(user_id, limit=5):
+    """
+    Get content recommendations for a user using k-NN algorithm.
+    
+    Parameters:
+    user_id (int): The ID of the user
+    limit (int): Maximum number of recommendations to return
+    
+    Returns:
+    list: A list of recommended content items
+    """
+    user_vector = get_user_vector(user_id)
+    if user_vector is None:
+        return []
+    
+    # Get all content
+    all_content = ProgrammingContent.query.all()
+    if not all_content:
+        return []
+    
+    # Get content vectors
+    content_vectors = []
+    content_ids = []
+    
+    for content in all_content:
+        content_vector = get_content_vector(content.id)
+        if content_vector is not None:
+            content_vectors.append(content_vector)
+            content_ids.append(content.id)
+    
+    if not content_vectors:
+        return []
+    
+    # Get completed content ids
+    completed_content_ids = [p.content_id for p in UserProgress.query.filter_by(
+        user_id=user_id, status="Completed").all()]
+    
+    # Convert to numpy array
+    content_vectors = np.array(content_vectors)
+    
+    # Use k-NN to find similar content
+    n_neighbors = min(limit + len(completed_content_ids), len(content_vectors))
+    if n_neighbors <= 0:
+        return []
+    
+    knn = NearestNeighbors(n_neighbors=n_neighbors, metric='cosine')
+    knn.fit(content_vectors)
+    
+    distances, indices = knn.kneighbors(user_vector)
+    
+    # Get recommended content
+    recommended = []
+    for idx in indices[0]:
+        content_id = content_ids[idx]
+        # Skip already completed content
+        if content_id not in completed_content_ids:
+            content = ProgrammingContent.query.get(content_id)
+            if content:
+                recommended.append(content)
+                if len(recommended) >= limit:
+                    break
+    
+    return recommended
+
+def get_similar_content(content_id, limit=3):
+    """
+    Find content items similar to the given content.
+    
+    Parameters:
+    content_id (int): The ID of the content to find similar items for
+    limit (int): Maximum number of similar items to return
+    
+    Returns:
+    list: A list of similar content items
+    """
+    content_vector = get_content_vector(content_id)
+    if content_vector is None:
+        return []
+    
+    # Get all content
+    all_content = ProgrammingContent.query.all()
+    if not all_content:
+        return []
+    
+    # Get content vectors
+    content_vectors = []
+    content_ids = []
+    
+    for content in all_content:
+        if content.id != content_id:  # Exclude the current content
+            content_vector_i = get_content_vector(content.id)
+            if content_vector_i is not None:
+                content_vectors.append(content_vector_i)
+                content_ids.append(content.id)
+    
+    if not content_vectors:
+        return []
+    
+    # Convert to numpy array
+    content_vectors = np.array(content_vectors)
+    content_vector = content_vector.reshape(1, -1)
+    
+    # Use k-NN to find similar content
+    n_neighbors = min(limit, len(content_vectors))
+    if n_neighbors <= 0:
+        return []
+    
+    knn = NearestNeighbors(n_neighbors=n_neighbors, metric='cosine')
+    knn.fit(content_vectors)
+    
+    distances, indices = knn.kneighbors(content_vector)
+    
+    # Get similar content
+    similar = []
+    for idx in indices[0]:
+        content = ProgrammingContent.query.get(content_ids[idx])
+        if content:
+            similar.append(content)
+    
+    return similar
