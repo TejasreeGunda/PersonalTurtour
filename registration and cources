@@ -1,0 +1,802 @@
+import os
+import logging
+from datetime import datetime
+import json
+
+from flask import render_template, request, redirect, url_for, flash, jsonify, session
+from flask_login import login_user, logout_user, current_user, login_required
+from werkzeug.security import generate_password_hash, check_password_hash
+
+from app import app, db
+from models import User, ProgrammingContent, UserProgress, Exam, ExamQuestion, ExamAttempt, ExamAnswer
+from recommendation import get_user_recommendations, get_similar_content
+
+# Home page
+@app.route('/')
+def index():
+    featured_content = ProgrammingContent.query.order_by(ProgrammingContent.date_created.desc()).limit(6).all()
+    
+    # Get languages for filtering
+    languages = db.session.query(ProgrammingContent.programming_language).distinct().all()
+    languages = [lang[0] for lang in languages]
+    
+    # Get recommended content if user is logged in
+    recommended_content = []
+    if current_user.is_authenticated:
+        recommended_content = get_user_recommendations(current_user.id, limit=3)
+    
+    return render_template('index.html', 
+                          featured_content=featured_content,
+                          recommended_content=recommended_content,
+                          languages=languages)
+
+# User registration
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    
+    if request.method == 'POST':
+        username = request.form.get('username')
+        email = request.form.get('email')
+        password = request.form.get('password')
+        confirm_password = request.form.get('confirm_password')
+        
+        # Validate input
+        if not username or not email or not password:
+            flash('All fields are required!', 'danger')
+            return redirect(url_for('register'))
+        
+        if password != confirm_password:
+            flash('Passwords do not match!', 'danger')
+            return redirect(url_for('register'))
+        
+        # Check if username or email already exists
+        if User.query.filter_by(username=username).first():
+            flash('Username already exists!', 'danger')
+            return redirect(url_for('register'))
+        
+        if User.query.filter_by(email=email).first():
+            flash('Email already exists!', 'danger')
+            return redirect(url_for('register'))
+        
+        # Create new user
+        new_user = User(
+            username=username,
+            email=email,
+            password_hash=generate_password_hash(password),
+            known_languages="[]",
+            target_languages="[]",
+            learning_goals="[]",
+            exam_goals="[]"
+        )
+        
+        db.session.add(new_user)
+        db.session.commit()
+        
+        flash('Registration successful! Please login.', 'success')
+        return redirect(url_for('login'))
+    
+    return render_template('register.html')
+
+# User login
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        remember = True if request.form.get('remember') else False
+        
+        user = User.query.filter_by(username=username).first()
+        
+        # Check if user exists and password is correct
+        if not user or not check_password_hash(user.password_hash, password):
+            flash('Invalid username or password', 'danger')
+            return redirect(url_for('login'))
+        
+        # Log in user
+        login_user(user, remember=remember)
+        
+        # Redirect to requested page or dashboard
+        next_page = request.args.get('next')
+        if not next_page or not next_page.startswith('/'):
+            next_page = url_for('dashboard')
+        
+        flash('Login successful!', 'success')
+        return redirect(next_page)
+    
+    return render_template('login.html')
+
+# User logout
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash('You have been logged out.', 'info')
+    return redirect(url_for('index'))
+
+# User profile
+@app.route('/profile', methods=['GET', 'POST'])
+@login_required
+def profile():
+    if request.method == 'POST':
+        # Update user profile information
+        current_user.programming_experience = request.form.get('programming_experience')
+        
+        known_languages = request.form.getlist('known_languages')
+        target_languages = request.form.getlist('target_languages')
+        learning_goals = request.form.getlist('learning_goals')
+        exam_goals = request.form.getlist('exam_goals')
+        
+        current_user.set_known_languages(known_languages)
+        current_user.set_target_languages(target_languages)
+        current_user.set_learning_goals(learning_goals)
+        current_user.set_exam_goals(exam_goals)
+        
+        db.session.commit()
+        flash('Profile updated successfully!', 'success')
+        return redirect(url_for('profile'))
+    
+    # Get all programming languages for the form
+    languages = ["Python", "JavaScript", "Java", "C#", "C++", "PHP", "Ruby", "Swift", "Go", "Kotlin", "TypeScript", "SQL", "Rust"]
+    
+    # Get common programming exams
+    exams = ["AWS Certified Developer", "Microsoft Azure Developer", "Oracle Java Certification", 
+             "CompTIA A+", "Cisco CCNA", "Google Cloud Associate Developer", 
+             "Python Institute PCAP", "JavaScript JSNAD"]
+    
+    return render_template('profile.html', 
+                          languages=languages,
+                          exams=exams)
+
+# User dashboard
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    # Get user's progress
+    progress = UserProgress.query.filter_by(user_id=current_user.id).all()
+    
+    # Get user's recommended content
+    recommendations = get_user_recommendations(current_user.id, limit=6)
+    
+    # Get user's exam attempts
+    exam_attempts = ExamAttempt.query.filter_by(user_id=current_user.id).order_by(ExamAttempt.start_time.desc()).limit(5).all()
+    
+    # Get progress statistics
+    total_content = ProgrammingContent.query.count()
+    completed_content = UserProgress.query.filter_by(user_id=current_user.id, status="Completed").count()
+    in_progress_content = UserProgress.query.filter_by(user_id=current_user.id, status="In Progress").count()
+    
+    completion_percentage = 0
+    if total_content > 0:
+        completion_percentage = (completed_content / total_content) * 100
+    
+    # Get target languages progress
+    target_languages = current_user.get_target_languages()
+    language_progress = []
+    
+    for language in target_languages:
+        language_content = ProgrammingContent.query.filter_by(programming_language=language).count()
+        language_completed = UserProgress.query.join(ProgrammingContent).filter(
+            UserProgress.user_id == current_user.id,
+            UserProgress.status == "Completed",
+            ProgrammingContent.programming_language == language
+        ).count()
+        
+        language_percentage = 0
+        if language_content > 0:
+            language_percentage = (language_completed / language_content) * 100
+        
+        language_progress.append({
+            'language': language,
+            'percentage': language_percentage,
+            'completed': language_completed,
+            'total': language_content
+        })
+    
+    return render_template('dashboard.html',
+                          progress=progress,
+                          recommendations=recommendations,
+                          exam_attempts=exam_attempts,
+                          completed_content=completed_content,
+                          in_progress_content=in_progress_content,
+                          total_content=total_content,
+                          completion_percentage=completion_percentage,
+                          language_progress=language_progress)
+
+# Content listing page
+@app.route('/content')
+def content():
+    # Get filter parameters
+    language = request.args.get('language', '')
+    level = request.args.get('level', '')
+    content_type = request.args.get('type', '')
+    search = request.args.get('search', '')
+    
+    # Build query based on filters
+    query = ProgrammingContent.query
+    
+    if language:
+        query = query.filter_by(programming_language=language)
+    
+    if level:
+        query = query.filter_by(difficulty_level=level)
+    
+    if content_type:
+        query = query.filter_by(content_type=content_type)
+    
+    if search:
+        query = query.filter(ProgrammingContent.title.ilike(f'%{search}%') | 
+                             ProgrammingContent.description.ilike(f'%{search}%') |
+                             ProgrammingContent.keywords.ilike(f'%{search}%'))
+    
+    # Get all content with filters applied
+    all_content = query.order_by(ProgrammingContent.date_created.desc()).all()
+    
+    # Get filter options
+    languages = db.session.query(ProgrammingContent.programming_language).distinct().all()
+    languages = [lang[0] for lang in languages]
+    
+    levels = ['Beginner', 'Intermediate', 'Advanced']
+    types = ['Tutorial', 'Exercise', 'Reference']
+    
+    return render_template('content.html',
+                          content_list=all_content,
+                          languages=languages,
+                          levels=levels,
+                          types=types,
+                          current_language=language,
+                          current_level=level,
+                          current_type=content_type,
+                          search=search)
+
+# Content detail page
+@app.route('/content/<int:content_id>')
+def content_detail(content_id):
+    content = ProgrammingContent.query.get_or_404(content_id)
+    
+    # Get user progress for this content if logged in
+    user_progress = None
+    if current_user.is_authenticated:
+        user_progress = UserProgress.query.filter_by(
+            user_id=current_user.id,
+            content_id=content_id
+        ).first()
+        
+        # If no progress record exists, create one
+        if not user_progress:
+            user_progress = UserProgress(
+                user_id=current_user.id,
+                content_id=content_id,
+                status="Not Started",
+                progress_percentage=0,
+                last_accessed=datetime.utcnow()
+            )
+            db.session.add(user_progress)
+            db.session.commit()
+        else:
+            # Update last accessed time
+            user_progress.last_accessed = datetime.utcnow()
+            db.session.commit()
+    
+    # Get similar content
+    similar_content = get_similar_content(content_id, limit=3)
+    
+    return render_template('content_detail.html',
+                          content=content,
+                          user_progress=user_progress,
+                          similar_content=similar_content)
+
+# Update user progress
+@app.route('/update_progress', methods=['POST'])
+@login_required
+def update_progress():
+    content_id = request.form.get('content_id')
+    progress_percentage = request.form.get('progress_percentage', type=int)
+    status = request.form.get('status')
+    
+    if not content_id or progress_percentage is None or not status:
+        flash('Missing required information', 'danger')
+        return redirect(url_for('content_detail', content_id=content_id))
+    
+    user_progress = UserProgress.query.filter_by(
+        user_id=current_user.id,
+        content_id=content_id
+    ).first()
+    
+    if not user_progress:
+        user_progress = UserProgress(
+            user_id=current_user.id,
+            content_id=content_id
+        )
+        db.session.add(user_progress)
+    
+    user_progress.progress_percentage = progress_percentage
+    user_progress.status = status
+    user_progress.last_accessed = datetime.utcnow()
+    
+    if status == "Completed":
+        user_progress.completed_date = datetime.utcnow()
+    
+    db.session.commit()
+    
+    flash('Progress updated successfully!', 'success')
+    return redirect(url_for('content_detail', content_id=content_id))
+
+# Exams listing page
+@app.route('/exams')
+def exams():
+    # Get filter parameters
+    language = request.args.get('language', '')
+    level = request.args.get('level', '')
+    search = request.args.get('search', '')
+    
+    # Build query based on filters
+    query = Exam.query
+    
+    if language:
+        query = query.filter_by(programming_language=language)
+    
+    if level:
+        query = query.filter_by(difficulty_level=level)
+    
+    if search:
+        query = query.filter(Exam.title.ilike(f'%{search}%') | 
+                            Exam.description.ilike(f'%{search}%'))
+    
+    # Get all exams with filters applied
+    all_exams = query.all()
+    
+    # Get filter options
+    languages = db.session.query(Exam.programming_language).distinct().all()
+    languages = [lang[0] for lang in languages]
+    
+    levels = ['Beginner', 'Intermediate', 'Advanced']
+    
+    return render_template('exams.html',
+                          exams=all_exams,
+                          languages=languages,
+                          levels=levels,
+                          current_language=language,
+                          current_level=level,
+                          search=search)
+
+# Exam detail page
+@app.route('/exam/<int:exam_id>')
+@login_required
+def exam_detail(exam_id):
+    exam = Exam.query.get_or_404(exam_id)
+    
+    # Get user's previous attempts
+    attempts = ExamAttempt.query.filter_by(
+        user_id=current_user.id,
+        exam_id=exam_id
+    ).order_by(ExamAttempt.start_time.desc()).all()
+    
+    return render_template('exam_detail.html',
+                          exam=exam,
+                          attempts=attempts)
+
+# Start exam
+@app.route('/start_exam/<int:exam_id>', methods=['POST'])
+@login_required
+def start_exam(exam_id):
+    exam = Exam.query.get_or_404(exam_id)
+    
+    # Create new attempt
+    new_attempt = ExamAttempt(
+        user_id=current_user.id,
+        exam_id=exam_id,
+        start_time=datetime.utcnow()
+    )
+    
+    db.session.add(new_attempt)
+    db.session.commit()
+    
+    # Redirect to exam page
+    return redirect(url_for('take_exam', attempt_id=new_attempt.id))
+
+# Take exam
+@app.route('/take_exam/<int:attempt_id>')
+@login_required
+def take_exam(attempt_id):
+    attempt = ExamAttempt.query.get_or_404(attempt_id)
+    
+    # Verify that this attempt belongs to the current user
+    if attempt.user_id != current_user.id:
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('exams'))
+    
+    # Check if exam is already completed
+    if attempt.end_time:
+        flash('This exam attempt has already been completed', 'warning')
+        return redirect(url_for('exam_results', attempt_id=attempt_id))
+    
+    # Get exam and questions
+    exam = attempt.exam
+    questions = exam.questions
+    
+    return render_template('take_exam.html',
+                          attempt=attempt,
+                          exam=exam,
+                          questions=questions)
+
+# Submit exam
+@app.route('/submit_exam/<int:attempt_id>', methods=['POST'])
+@login_required
+def submit_exam(attempt_id):
+    attempt = ExamAttempt.query.get_or_404(attempt_id)
+    
+    # Verify that this attempt belongs to the current user
+    if attempt.user_id != current_user.id:
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('exams'))
+    
+    # Check if exam is already completed
+    if attempt.end_time:
+        flash('This exam attempt has already been completed', 'warning')
+        return redirect(url_for('exam_results', attempt_id=attempt_id))
+    
+    # Get exam and questions
+    exam = attempt.exam
+    questions = exam.questions
+    
+    # Process answers
+    total_score = 0
+    max_score = 0
+    
+    for question in questions:
+        max_score += question.points
+        
+        # Get user answer
+        answer_key = f'question_{question.id}'
+        user_answer = request.form.get(answer_key, '')
+        
+        # Check if answer is correct
+        is_correct = False
+        points_awarded = 0
+        
+        if question.question_type == 'Multiple Choice':
+            is_correct = user_answer == question.correct_answer
+            points_awarded = question.points if is_correct else 0
+        elif question.question_type == 'Coding' or question.question_type == 'Short Answer':
+            # For coding/short answer questions, we'd need a more sophisticated evaluation
+            # For now, just do a simple string comparison
+            is_correct = user_answer.strip().lower() == question.correct_answer.strip().lower()
+            points_awarded = question.points if is_correct else 0
+        
+        # Save answer
+        answer = ExamAnswer(
+            attempt_id=attempt.id,
+            question_id=question.id,
+            user_answer=user_answer,
+            is_correct=is_correct,
+            points_awarded=points_awarded
+        )
+        
+        db.session.add(answer)
+        total_score += points_awarded
+    
+    # Update attempt
+    attempt.end_time = datetime.utcnow()
+    attempt.score = total_score
+    attempt.max_score = max_score
+    attempt.passed = (total_score / max_score * 100) >= exam.passing_percentage if max_score > 0 else False
+    
+    db.session.commit()
+    
+    flash('Exam submitted successfully!', 'success')
+    return redirect(url_for('exam_results', attempt_id=attempt_id))
+
+# Exam results
+@app.route('/exam_results/<int:attempt_id>')
+@login_required
+def exam_results(attempt_id):
+    attempt = ExamAttempt.query.get_or_404(attempt_id)
+    
+    # Verify that this attempt belongs to the current user
+    if attempt.user_id != current_user.id:
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('exams'))
+    
+    # Get exam and answers
+    exam = attempt.exam
+    answers = attempt.answers
+    
+    # Calculate percentage score
+    percentage = (attempt.score / attempt.max_score * 100) if attempt.max_score > 0 else 0
+    
+    return render_template('exam_results.html',
+                          attempt=attempt,
+                          exam=exam,
+                          answers=answers,
+                          percentage=percentage)
+
+# API for offline synchronization
+@app.route('/api/sync', methods=['POST'])
+@login_required
+def sync_data():
+    data = request.json
+    
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+    
+    # Process progress updates
+    progress_updates = data.get('progress', [])
+    for progress in progress_updates:
+        content_id = progress.get('content_id')
+        status = progress.get('status')
+        progress_percentage = progress.get('progress_percentage')
+        
+        if not content_id or not status or progress_percentage is None:
+            continue
+        
+        # Update or create progress record
+        user_progress = UserProgress.query.filter_by(
+            user_id=current_user.id,
+            content_id=content_id
+        ).first()
+        
+        if not user_progress:
+            user_progress = UserProgress(
+                user_id=current_user.id,
+                content_id=content_id,
+                status=status,
+                progress_percentage=progress_percentage,
+                last_accessed=datetime.utcnow()
+            )
+            db.session.add(user_progress)
+        else:
+            user_progress.status = status
+            user_progress.progress_percentage = progress_percentage
+            user_progress.last_accessed = datetime.utcnow()
+        
+        if status == "Completed" and not user_progress.completed_date:
+            user_progress.completed_date = datetime.utcnow()
+    
+    # Commit all changes
+    db.session.commit()
+    
+    return jsonify({'status': 'success'})
+
+# API to get content for offline use
+@app.route('/api/offline_content')
+@login_required
+def offline_content():
+    # Get user's target languages and preferences
+    target_languages = current_user.get_target_languages()
+    
+    # Get content based on user preferences
+    query = ProgrammingContent.query
+    
+    if target_languages:
+        query = query.filter(ProgrammingContent.programming_language.in_(target_languages))
+    
+    # Limit content to reasonable amount for offline storage
+    content_list = query.limit(20).all()
+    
+    # Convert to JSON-serializable format
+    result = []
+    for content in content_list:
+        result.append({
+            'id': content.id,
+            'title': content.title,
+            'description': content.description,
+            'content': content.content,
+            'programming_language': content.programming_language,
+            'difficulty_level': content.difficulty_level,
+            'content_type': content.content_type,
+            'keywords': content.get_keywords()
+        })
+    
+    return jsonify(result)
+
+# Service worker route
+@app.route('/sw.js')
+def service_worker():
+    return app.send_static_file('js/sw.js')
+
+# Error handlers
+@app.errorhandler(404)
+def page_not_found(e):
+    return render_template('404.html'), 404
+
+@app.errorhandler(500)
+def internal_server_error(e):
+    return render_template('500.html'), 500
+
+# Initialize the database with seed data
+@app.cli.command('init-db')
+def init_db_command():
+    """Initialize the database with seed data."""
+    # Create tables
+    db.create_all()
+    
+    # Add sample programming content
+    seed_content()
+    
+    # Add sample exams
+    seed_exams()
+    
+    print('Database initialized with seed data.')
+
+def seed_content():
+    """Add sample programming content to the database."""
+    # Check if content already exists
+    if ProgrammingContent.query.first():
+        return
+    
+    # Sample Python content
+    python_content = [
+        {
+            'title': 'Introduction to Python',
+            'description': 'Learn the basics of Python programming language.',
+            'content': '<h1>Introduction to Python</h1><p>Python is a high-level, interpreted, general-purpose programming language. Its design philosophy emphasizes code readability with the use of significant indentation.</p><h2>Getting Started</h2><p>To write your first Python program, create a file with a .py extension and write:</p><pre><code>print("Hello, World!")</code></pre><p>Run this file using the Python interpreter to see the output.</p>',
+            'programming_language': 'Python',
+            'difficulty_level': 'Beginner',
+            'content_type': 'Tutorial',
+            'keywords': json.dumps(['python', 'basics', 'introduction', 'beginner'])
+        },
+        {
+            'title': 'Python Data Structures',
+            'description': 'Learn about lists, dictionaries, tuples, and sets in Python.',
+            'content': '<h1>Python Data Structures</h1><p>Python has several built-in data structures that make it powerful and flexible.</p><h2>Lists</h2><p>Lists are ordered collections of items:</p><pre><code>fruits = ["apple", "banana", "cherry"]</code></pre><h2>Dictionaries</h2><p>Dictionaries store key-value pairs:</p><pre><code>person = {"name": "John", "age": 30}</code></pre><h2>Tuples</h2><p>Tuples are immutable ordered collections:</p><pre><code>coordinates = (10, 20)</code></pre><h2>Sets</h2><p>Sets store unique items:</p><pre><code>unique_numbers = {1, 2, 3, 4, 5}</code></pre>',
+            'programming_language': 'Python',
+            'difficulty_level': 'Beginner',
+            'content_type': 'Tutorial',
+            'keywords': json.dumps(['python', 'data structures', 'lists', 'dictionaries', 'tuples', 'sets'])
+        },
+        {
+            'title': 'Python Functions and Modules',
+            'description': 'Learn how to create and use functions and modules in Python.',
+            'content': '<h1>Python Functions and Modules</h1><p>Functions are blocks of reusable code, and modules help organize code into manageable units.</p><h2>Functions</h2><p>Define a function using the def keyword:</p><pre><code>def greet(name):\n    return f"Hello, {name}!"</code></pre><p>Call the function:</p><pre><code>message = greet("Alice")\nprint(message)  # Output: Hello, Alice!</code></pre><h2>Modules</h2><p>Save functions in a separate .py file (module) and import them:</p><pre><code># In greetings.py\ndef greet(name):\n    return f"Hello, {name}!"</code></pre><p>Import and use the module:</p><pre><code># In main.py\nimport greetings\nmessage = greetings.greet("Bob")\nprint(message)</code></pre>',
+            'programming_language': 'Python',
+            'difficulty_level': 'Intermediate',
+            'content_type': 'Tutorial',
+            'keywords': json.dumps(['python', 'functions', 'modules', 'intermediate'])
+        }
+    ]
+    
+    # Sample JavaScript content
+    javascript_content = [
+        {
+            'title': 'JavaScript Fundamentals',
+            'description': 'Learn the basics of JavaScript programming language.',
+            'content': '<h1>JavaScript Fundamentals</h1><p>JavaScript is a high-level, interpreted programming language that conforms to the ECMAScript specification.</p><h2>Variables</h2><p>Declare variables using let, const, or var:</p><pre><code>let name = "John";\nconst age = 30;\nvar isActive = true;</code></pre><h2>Data Types</h2><p>JavaScript has several primitive data types:</p><pre><code>// String\nlet greeting = "Hello";\n\n// Number\nlet count = 42;\n\n// Boolean\nlet isValid = true;\n\n// Undefined\nlet result;\n\n// Null\nlet empty = null;\n\n// Symbol\nlet uniqueKey = Symbol("id");</code></pre>',
+            'programming_language': 'JavaScript',
+            'difficulty_level': 'Beginner',
+            'content_type': 'Tutorial',
+            'keywords': json.dumps(['javascript', 'basics', 'introduction', 'beginner'])
+        },
+        {
+            'title': 'JavaScript DOM Manipulation',
+            'description': 'Learn how to manipulate the Document Object Model (DOM) using JavaScript.',
+            'content': '<h1>JavaScript DOM Manipulation</h1><p>The Document Object Model (DOM) is a programming interface for web documents. It represents the page so that programs can change the document structure, style, and content.</p><h2>Selecting Elements</h2><p>Select elements using various methods:</p><pre><code>// By ID\nconst element = document.getElementById("myId");\n\n// By class name\nconst elements = document.getElementsByClassName("myClass");\n\n// By tag name\nconst paragraphs = document.getElementsByTagName("p");\n\n// Using CSS selectors\nconst firstElement = document.querySelector(".myClass");\nconst allElements = document.querySelectorAll(".myClass");</code></pre><h2>Modifying Elements</h2><p>Change content and attributes:</p><pre><code>// Changing text content\nelement.textContent = "New text";\n\n// Changing HTML content\nelement.innerHTML = "<strong>Bold text</strong>";\n\n// Setting attributes\nelement.setAttribute("href", "https://example.com");\n\n// Changing styles\nelement.style.color = "red";\nelement.style.fontSize = "16px";</code></pre>',
+            'programming_language': 'JavaScript',
+            'difficulty_level': 'Intermediate',
+            'content_type': 'Tutorial',
+            'keywords': json.dumps(['javascript', 'dom', 'web development', 'intermediate'])
+        }
+    ]
+    
+    # Sample Java content
+    java_content = [
+        {
+            'title': 'Java Basics',
+            'description': 'Learn the fundamentals of Java programming language.',
+            'content': '<h1>Java Basics</h1><p>Java is a class-based, object-oriented programming language designed for having fewer implementation dependencies.</p><h2>Your First Java Program</h2><p>Here\'s a simple "Hello, World!" program in Java:</p><pre><code>public class HelloWorld {\n    public static void main(String[] args) {\n        System.out.println("Hello, World!");\n    }\n}</code></pre><h2>Variables and Data Types</h2><p>Java has several primitive data types:</p><pre><code>// Integer types\nbyte byteVar = 127;\nshort shortVar = 32767;\nint intVar = 2147483647;\nlong longVar = 9223372036854775807L;\n\n// Floating-point types\nfloat floatVar = 3.14f;\ndouble doubleVar = 3.14159;\n\n// Character type\nchar charVar = \'A\';\n\n// Boolean type\nboolean boolVar = true;</code></pre>',
+            'programming_language': 'Java',
+            'difficulty_level': 'Beginner',
+            'content_type': 'Tutorial',
+            'keywords': json.dumps(['java', 'basics', 'introduction', 'beginner'])
+        }
+    ]
+    
+    # Combine all content
+    all_content = python_content + javascript_content + java_content
+    
+    # Add content to database
+    for content_data in all_content:
+        content = ProgrammingContent(**content_data)
+        db.session.add(content)
+    
+    db.session.commit()
+
+def seed_exams():
+    """Add sample exams to the database."""
+    # Check if exams already exist
+    if Exam.query.first():
+        return
+    
+    # Sample Python exam
+    python_exam = Exam(
+        title='Python Fundamentals Exam',
+        description='Test your knowledge of Python fundamentals including variables, data types, and basic operations.',
+        programming_language='Python',
+        difficulty_level='Beginner',
+        time_limit_minutes=30,
+        passing_percentage=70
+    )
+    db.session.add(python_exam)
+    db.session.flush()  # Get the ID without committing
+    
+    # Add questions for Python exam
+    python_questions = [
+        {
+            'exam_id': python_exam.id,
+            'question_text': 'What is the output of the following code?\n\nx = 5\ny = 10\nprint(x + y)',
+            'question_type': 'Multiple Choice',
+            'options': json.dumps(['15', '510', 'Error', '5 + 10']),
+            'correct_answer': '15',
+            'points': 1
+        },
+        {
+            'exam_id': python_exam.id,
+            'question_text': 'Which of the following is a mutable data type in Python?',
+            'question_type': 'Multiple Choice',
+            'options': json.dumps(['String', 'Tuple', 'List', 'Integer']),
+            'correct_answer': 'List',
+            'points': 1
+        },
+        {
+            'exam_id': python_exam.id,
+            'question_text': 'Write a Python function that takes a list of numbers and returns the sum of all even numbers in the list.',
+            'question_type': 'Coding',
+            'options': None,
+            'correct_answer': 'def sum_even(numbers):\n    return sum(num for num in numbers if num % 2 == 0)',
+            'points': 3
+        }
+    ]
+    
+    for question_data in python_questions:
+        question = ExamQuestion(**question_data)
+        db.session.add(question)
+    
+    # Sample JavaScript exam
+    js_exam = Exam(
+        title='JavaScript Basics Exam',
+        description='Test your knowledge of JavaScript basics including variables, functions, and DOM manipulation.',
+        programming_language='JavaScript',
+        difficulty_level='Beginner',
+        time_limit_minutes=30,
+        passing_percentage=70
+    )
+    db.session.add(js_exam)
+    db.session.flush()  # Get the ID without committing
+    
+    # Add questions for JavaScript exam
+    js_questions = [
+        {
+            'exam_id': js_exam.id,
+            'question_text': 'What is the output of the following code?\n\nconsole.log(typeof []);',
+            'question_type': 'Multiple Choice',
+            'options': json.dumps(['array', 'object', 'undefined', 'null']),
+            'correct_answer': 'object',
+            'points': 1
+        },
+        {
+            'exam_id': js_exam.id,
+            'question_text': 'Which method is used to add an element to the end of an array in JavaScript?',
+            'question_type': 'Multiple Choice',
+            'options': json.dumps(['push()', 'append()', 'add()', 'insert()']),
+            'correct_answer': 'push()',
+            'points': 1
+        },
+        {
+            'exam_id': js_exam.id,
+            'question_text': 'Write a JavaScript function that takes an array of numbers and returns a new array with only the even numbers.',
+            'question_type': 'Coding',
+            'options': None,
+            'correct_answer': 'function filterEven(numbers) {\n    return numbers.filter(num => num % 2 === 0);\n}',
+            'points': 3
+        }
+    ]
+    
+    for question_data in js_questions:
+        question = ExamQuestion(**question_data)
+        db.session.add(question)
+    
+    db.session.commit()
